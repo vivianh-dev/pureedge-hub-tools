@@ -1,293 +1,510 @@
 #!/bin/sh
-# wiz-keepalive.sh
-#
-# Keeps Wi-Fi lighting clients (WiZ fixtures and similar) associated with the
-# access point by sweeping the local subnet on a fixed interval. Sleeping
-# clients that go quiet can get aged out of the AP and drop off the
-# controller.
-#
-# Generic: works on any Raspberry Pi / Debian-family Linux, any subnet, wired
-# or wireless. Auto-detects the subnet and the tooling present.
-#
-# Usage (run ON the Pi, as root or with sudo):
-#   sudo sh wiz-keepalive.sh install
-#   sudo sh wiz-keepalive.sh remove
-#   sudo sh wiz-keepalive.sh status
-#   sudo sh wiz-keepalive.sh run
-#   sudo sh wiz-keepalive.sh discover
-#
-# Sweep method, in order of preference:
-#   nmap -sn   host discovery (ARP, since this runs as root)
-#   ping       one unicast probe per address in the subnet
-#
-# This is a trial, not a proven fix. It increases how often the network sees
-# the fixtures. It cannot repair a fixture that has failed to associate, RF
-# or capacity problems, client isolation, or a hub whose lighting
-# application has stopped.
+# Runs on the Pi. A trial network sweep; it does not establish or repair
+# fixture association, discovery, or lighting commands.
+# Usage: sudo sh wiz-keepalive.sh install|remove|status|run
+#        sh wiz-keepalive.sh discover
 
 WRAPPER=/usr/local/bin/wiz-keepalive-sweep
 CRONFILE=/etc/cron.d/wiz-keepalive
 UNITFILE=/etc/systemd/system/wiz-keepalive.service
 TIMERFILE=/etc/systemd/system/wiz-keepalive.timer
-INTERVAL=10
 
-log() { echo "wiz-keepalive: $*"; }
 die() { echo "wiz-keepalive: $*" >&2; exit 1; }
+log() { echo "wiz-keepalive: $*"; }
 
-require_root() {
-    [ "$(id -u)" = 0 ] || die "this must run as root: use 'sudo sh $0 $1'"
+# Validate and normalize IPv4 CIDRs. Limit a sweep to at most 65,536
+# addresses; fail explicitly rather than silently truncating a larger LAN.
+ipv4_range() {
+    awk -v cidr="$1" -v mode="$2" '
+    function ip(n, a,b,c,d) {
+        a=int(n/16777216); b=int(n/65536)%256; c=int(n/256)%256; d=n%256
+        return sprintf("%d.%d.%d.%d",a,b,c,d)
+    }
+    BEGIN {
+        if (split(cidr,p,"/") != 2 || p[2] !~ /^[0-9]+$/ || p[2]<16 || p[2]>32)
+            exit 1
+        if (split(p[1],o,".") != 4) exit 1
+        n=0
+        for(i=1;i<=4;i++) {
+            if(o[i] !~ /^[0-9]+$/ || o[i]>255) exit 1
+            n=n*256+o[i]
+        }
+        size=2^(32-p[2]); base=int(n/size)*size
+        if(mode=="cidr") { print ip(base) "/" (p[2]+0); exit }
+        first=base+(size>2); last=base+size-1-(size>2)
+        for(n=first;n<=last;n++) print ip(n)
+    }'
 }
 
-# The interface that carries traffic to the rest of the network. Falls back
-# to the first non-tunnel interface with a global address.
-detect_iface() {
-    _dev=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-    if [ -z "$_dev" ]; then
-        _dev=$(ip -4 addr show scope global 2>/dev/null |
-            awk '/:/ {name=$2; sub(/:$/,"",name); if (name !~ /^(wg|tun|tap|lo)/) {print name; exit}}')
+linux_cidr() {
+    dev=${WIZ_KEEPALIVE_INTERFACE:-}
+    if [ -z "$dev" ]; then
+        dev=$(ip -4 route show default 2>/dev/null |
+            awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
     fi
-    [ -n "$_dev" ] || return 1
-    printf '%s\n' "$_dev"
+    if [ -z "$dev" ]; then
+        dev=$(ip -o -4 addr show scope global 2>/dev/null |
+            awk '$2 !~ /^(lo|wg|tun|tap)/ {sub(/@.*/,"",$2); print $2; exit}')
+    fi
+    [ -n "$dev" ] || return 1
+    addr=$(ip -o -4 addr show dev "$dev" scope global 2>/dev/null |
+        awk '$3=="inet" {print $4; exit}')
+    ipv4_range "$addr" cidr
 }
 
-# The address and prefix length of that interface, e.g. 10.10.66.84/24
-detect_addr() {
-    _dev=$(detect_iface) || return 1
-    ip -4 addr show dev "$_dev" 2>/dev/null | awk '/inet /{print $2; exit}'
+macos_cidr() {
+    dev=${WIZ_KEEPALIVE_INTERFACE:-}
+    if [ -z "$dev" ]; then
+        dev=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+    fi
+    [ -n "$dev" ] || return 1
+    info=$(ifconfig "$dev" 2>/dev/null | awk '/inet / {
+        for(i=1;i<=NF;i++) if($i=="netmask") {print $2, $(i+1); exit}}')
+    addr=${info%% *}; mask=${info#* }
+    # BSD ifconfig normally prints a hexadecimal mask. Count its one bits,
+    # rejecting noncontiguous masks instead of guessing /24.
+    prefix=$(awk -v mask="$mask" '
+        BEGIN {
+            if(mask ~ /^0x/) {
+                sub(/^0x/,"",mask); mask=tolower(mask)
+                if(length(mask)!=8) exit 1
+                for(i=1;i<=8;i++) {
+                    v=index("0123456789abcdef",substr(mask,i,1))-1
+                    if(v<0) exit 1
+                    for(b=8;b>=1;b/=2) {
+                        bit=int(v/b); v%=b
+                        if(bit) {if(zero) exit 1; ones++} else zero=1
+                    }
+                }
+            } else {
+                if(split(mask,o,".")!=4) exit 1
+                for(i=1;i<=4;i++) {
+                    if(o[i] !~ /^[0-9]+$/ || o[i]>255) exit 1
+                    v=o[i]+0
+                    for(b=128;b>=1;b/=2) {
+                        bit=int(v/b); v%=b
+                        if(bit) {if(zero) exit 1; ones++} else zero=1
+                    }
+                }
+            }
+            print ones+0
+        }') || return 1
+    ipv4_range "$addr/$prefix" cidr
 }
 
-# The subnet in CIDR form, e.g. 10.10.66.0/24
 detect_cidr() {
-    _addr=$(detect_addr) || return 1
-    [ -n "$_addr" ] || return 1
-    _ip=${_addr%/*}
-    _len=${_addr#*/}
-    [ "$_len" = "$_addr" ] && _len=24
-    printf '%s/%s\n' "$_ip" "$_len"
+    case "$(uname -s)" in
+        Linux) linux_cidr ;;
+        Darwin) macos_cidr ;;
+        *) return 1 ;;
+    esac
 }
 
-# Minute offsets for the cron entry, spread across the interval so several
-# hubs on one site do not all sweep at the same moment.
+# Exit 1 from ping means no reply, not a broken scan. Other failures must
+# reach the caller. Limit concurrency to 16 probes on every platform.
+wait_probes() {
+    failed=0
+    for pid in $pids; do
+        wait "$pid"
+        probe_rc=$?
+        [ "$probe_rc" -le 1 ] || failed=1
+    done
+    [ "$failed" -eq 0 ]
+}
+
+ping_hosts() {
+    command -v ping >/dev/null 2>&1 || { echo "ping is unavailable" >&2; return 1; }
+    hosts=$(ipv4_range "$1" hosts) || return 1
+    pids=""; count=0; scan_failed=0
+    platform=$(uname -s)
+    for target in $hosts; do
+        (
+            if [ "$platform" = Darwin ]; then
+                ping -c 1 -t 1 "$target" >/dev/null 2>&1
+            else
+                ping -c 1 -W 1 "$target" >/dev/null 2>&1
+            fi
+            probe_rc=$?
+            if [ "$probe_rc" -eq 0 ] && [ "$2" = discover ]; then echo "$target"; fi
+            exit "$probe_rc"
+        ) &
+        pids="$pids $!"; count=$((count + 1))
+        if [ "$count" -eq 16 ]; then
+            wait_probes || scan_failed=1
+            pids=""; count=0
+        fi
+    done
+    wait_probes || scan_failed=1
+    [ "$scan_failed" -eq 0 ]
+}
+
+discover() {
+    cidr=$(detect_cidr) || { echo "cannot detect an IPv4 subnet (/16 through /32)" >&2; return 1; }
+    log "scanning $cidr for candidate hubs"
+    discovery_file=$(mktemp) || return 1
+    if command -v nmap >/dev/null 2>&1; then
+        if ! nmap -sn -n -T4 --host-timeout 5s "$cidr" > "$discovery_file"; then
+            rm -f "$discovery_file"
+            echo "nmap discovery failed" >&2
+            return 1
+        fi
+        found_hosts=$(awk '/^Nmap scan report for /{print $NF}' "$discovery_file")
+    else
+        if ! ping_hosts "$cidr" discover > "$discovery_file"; then
+            rm -f "$discovery_file"
+            echo "ping discovery failed" >&2
+            return 1
+        fi
+        found_hosts=$(cat "$discovery_file")
+    fi
+    rm -f "$discovery_file"
+    for candidate in $found_hosts; do
+        ports=""
+        if command -v nc >/dev/null 2>&1; then
+            for port in 22 80 443; do
+                if [ "$(uname -s)" = Darwin ]; then
+                    nc -z -G 1 -w 1 "$candidate" "$port" >/dev/null 2>&1 && ports="$ports $port"
+                else
+                    nc -z -w 1 "$candidate" "$port" >/dev/null 2>&1 && ports="$ports $port"
+                fi
+            done
+            echo "$candidate  open ports:${ports:- none} (candidate only)"
+        else
+            echo "$candidate  responding host (nc unavailable; ports unchecked)"
+        fi
+    done
+    return 0
+}
+
+require_root() { [ "$(id -u)" -eq 0 ] || die "use sudo sh $0 $1"; }
+using_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+
 stagger_minutes() {
-    _seed=$(cat /etc/machine-id 2>/dev/null || hostname 2>/dev/null || echo default)
-    _n=$(printf '%s' "$_seed" | cksum | awk '{print $1 % 10}')
-    printf '%s,%s,%s,%s,%s,%s' "$_n" "$((_n + 2))" "$((_n + 4))" "$((_n + 6))" "$((_n + 8))" "$((_n + 10))"
+    seed=$(cat /etc/machine-id 2>/dev/null || hostname) || return 1
+    offset=$(printf '%s' "$seed" | cksum | awk '{print $1 % 10}')
+    printf '%s,%s,%s,%s,%s,%s\n' "$offset" "$((offset+10))" "$((offset+20))" "$((offset+30))" "$((offset+40))" "$((offset+50))"
+}
+
+# Write new content completely before replacing an installed file.
+atomic_write() {
+    destination=$1; permissions=$2
+    mkdir -p "$(dirname "$destination")" || return 1
+    staging=$(mktemp "$destination.XXXXXX") || return 1
+    if cat > "$staging" && chmod "$permissions" "$staging" && mv -f "$staging" "$destination"; then
+        return 0
+    fi
+    rm -f "$staging"
+    return 1
 }
 
 write_wrapper() {
-    _dir=$(dirname "$WRAPPER")
-    mkdir -p "$_dir" || return 1
-    cat > "$WRAPPER" <<'EOF' || return 1
+    interface=${WIZ_KEEPALIVE_INTERFACE:-}
+    case "$interface" in *[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+    {
+        printf '#!/bin/sh\nWIZ_KEEPALIVE_INTERFACE=%s\nexport WIZ_KEEPALIVE_INTERFACE\n' "$interface"
+        cat <<'SWEEP'
 #!/bin/sh
-# wiz-keepalive sweep, generated by wiz-keepalive.sh
-# Exit non-zero if it cannot work, so the scheduler shows the failure.
-DEV=""
-DEV=$(ip route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-if [ -z "$DEV" ]; then
-    DEV=$(ip -4 addr show scope global 2>/dev/null |
-        awk '/:/ {name=$2; sub(/:$/,"",name); if (name !~ /^(wg|tun|tap|lo)/) {print name; exit}}')
-fi
-[ -n "$DEV" ] || { echo "no usable network interface" >&2; exit 1; }
-ADDR=$(ip -4 addr show dev "$DEV" 2>/dev/null | awk '/inet /{print $2; exit}')
-[ -n "$ADDR" ] || { echo "no address on $DEV" >&2; exit 1; }
-IP=${ADDR%/*}
-LEN=${ADDR#*/}
-[ "$LEN" = "$ADDR" ] && LEN=24
-CIDR="$IP/$LEN"
+die() { echo "wiz-keepalive: $*" >&2; exit 1; }
+log() { echo "wiz-keepalive: $*"; }
 
-if [ -x /usr/bin/nmap ]; then
-    nmap -sn -n -T4 --max-retries 1 --host-timeout 5s "$CIDR" >/dev/null 2>&1
-    exit $?
-fi
+# Validate and normalize IPv4 CIDRs. Limit a sweep to at most 65,536
+# addresses; fail explicitly rather than silently truncating a larger LAN.
+ipv4_range() {
+    awk -v cidr="$1" -v mode="$2" '
+    function ip(n, a,b,c,d) {
+        a=int(n/16777216); b=int(n/65536)%256; c=int(n/256)%256; d=n%256
+        return sprintf("%d.%d.%d.%d",a,b,c,d)
+    }
+    BEGIN {
+        if (split(cidr,p,"/") != 2 || p[2] !~ /^[0-9]+$/ || p[2]<16 || p[2]>32)
+            exit 1
+        if (split(p[1],o,".") != 4) exit 1
+        n=0
+        for(i=1;i<=4;i++) {
+            if(o[i] !~ /^[0-9]+$/ || o[i]>255) exit 1
+            n=n*256+o[i]
+        }
+        size=2^(32-p[2]); base=int(n/size)*size
+        if(mode=="cidr") { print ip(base) "/" (p[2]+0); exit }
+        first=base+(size>2); last=base+size-1-(size>2)
+        for(n=first;n<=last;n++) print ip(n)
+    }'
+}
 
-# No nmap: probe each address in the subnet individually.
-BASE=${IP%.*}
-LAST=${IP##*.}
-case "$LEN" in
-    24) RANGE=$(seq 1 254) ;;
-    25) RANGE=$(seq 1 126) ;;
-    26) RANGE=$(seq 1 62) ;;
-    27) RANGE=$(seq 1 30) ;;
-    28) RANGE=$(seq 1 14) ;;
-    *)  RANGE=$(seq 1 254) ;;
-esac
-for i in $RANGE; do
-    ping -c 1 -W 1 "$BASE.$i" >/dev/null 2>&1 &
-done
-wait
-exit 0
-EOF
-    chmod 755 "$WRAPPER" || return 1
+linux_cidr() {
+    dev=${WIZ_KEEPALIVE_INTERFACE:-}
+    if [ -z "$dev" ]; then
+        dev=$(ip -4 route show default 2>/dev/null |
+            awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+    fi
+    if [ -z "$dev" ]; then
+        dev=$(ip -o -4 addr show scope global 2>/dev/null |
+            awk '$2 !~ /^(lo|wg|tun|tap)/ {sub(/@.*/,"",$2); print $2; exit}')
+    fi
+    [ -n "$dev" ] || return 1
+    addr=$(ip -o -4 addr show dev "$dev" scope global 2>/dev/null |
+        awk '$3=="inet" {print $4; exit}')
+    ipv4_range "$addr" cidr
+}
+
+macos_cidr() {
+    dev=${WIZ_KEEPALIVE_INTERFACE:-}
+    if [ -z "$dev" ]; then
+        dev=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+    fi
+    [ -n "$dev" ] || return 1
+    info=$(ifconfig "$dev" 2>/dev/null | awk '/inet / {
+        for(i=1;i<=NF;i++) if($i=="netmask") {print $2, $(i+1); exit}}')
+    addr=${info%% *}; mask=${info#* }
+    # BSD ifconfig normally prints a hexadecimal mask. Count its one bits,
+    # rejecting noncontiguous masks instead of guessing /24.
+    prefix=$(awk -v mask="$mask" '
+        BEGIN {
+            if(mask ~ /^0x/) {
+                sub(/^0x/,"",mask); mask=tolower(mask)
+                if(length(mask)!=8) exit 1
+                for(i=1;i<=8;i++) {
+                    v=index("0123456789abcdef",substr(mask,i,1))-1
+                    if(v<0) exit 1
+                    for(b=8;b>=1;b/=2) {
+                        bit=int(v/b); v%=b
+                        if(bit) {if(zero) exit 1; ones++} else zero=1
+                    }
+                }
+            } else {
+                if(split(mask,o,".")!=4) exit 1
+                for(i=1;i<=4;i++) {
+                    if(o[i] !~ /^[0-9]+$/ || o[i]>255) exit 1
+                    v=o[i]+0
+                    for(b=128;b>=1;b/=2) {
+                        bit=int(v/b); v%=b
+                        if(bit) {if(zero) exit 1; ones++} else zero=1
+                    }
+                }
+            }
+            print ones+0
+        }') || return 1
+    ipv4_range "$addr/$prefix" cidr
+}
+
+detect_cidr() {
+    case "$(uname -s)" in
+        Linux) linux_cidr ;;
+        Darwin) macos_cidr ;;
+        *) return 1 ;;
+    esac
+}
+
+# Exit 1 from ping means no reply, not a broken scan. Other failures must
+# reach the caller. Limit concurrency to 16 probes on every platform.
+wait_probes() {
+    failed=0
+    for pid in $pids; do
+        wait "$pid"
+        probe_rc=$?
+        [ "$probe_rc" -le 1 ] || failed=1
+    done
+    [ "$failed" -eq 0 ]
+}
+
+ping_hosts() {
+    command -v ping >/dev/null 2>&1 || { echo "ping is unavailable" >&2; return 1; }
+    hosts=$(ipv4_range "$1" hosts) || return 1
+    pids=""; count=0; scan_failed=0
+    platform=$(uname -s)
+    for target in $hosts; do
+        (
+            if [ "$platform" = Darwin ]; then
+                ping -c 1 -t 1 "$target" >/dev/null 2>&1
+            else
+                ping -c 1 -W 1 "$target" >/dev/null 2>&1
+            fi
+            probe_rc=$?
+            if [ "$probe_rc" -eq 0 ] && [ "$2" = discover ]; then echo "$target"; fi
+            exit "$probe_rc"
+        ) &
+        pids="$pids $!"; count=$((count + 1))
+        if [ "$count" -eq 16 ]; then
+            wait_probes || scan_failed=1
+            pids=""; count=0
+        fi
+    done
+    wait_probes || scan_failed=1
+    [ "$scan_failed" -eq 0 ]
+}
+
+discover() {
+    cidr=$(detect_cidr) || { echo "cannot detect an IPv4 subnet (/16 through /32)" >&2; return 1; }
+    log "scanning $cidr for candidate hubs"
+    discovery_file=$(mktemp) || return 1
+    if command -v nmap >/dev/null 2>&1; then
+        if ! nmap -sn -n -T4 --host-timeout 5s "$cidr" > "$discovery_file"; then
+            rm -f "$discovery_file"
+            echo "nmap discovery failed" >&2
+            return 1
+        fi
+        found_hosts=$(awk '/^Nmap scan report for /{print $NF}' "$discovery_file")
+    else
+        if ! ping_hosts "$cidr" discover > "$discovery_file"; then
+            rm -f "$discovery_file"
+            echo "ping discovery failed" >&2
+            return 1
+        fi
+        found_hosts=$(cat "$discovery_file")
+    fi
+    rm -f "$discovery_file"
+    for candidate in $found_hosts; do
+        ports=""
+        if command -v nc >/dev/null 2>&1; then
+            for port in 22 80 443; do
+                if [ "$(uname -s)" = Darwin ]; then
+                    nc -z -G 1 -w 1 "$candidate" "$port" >/dev/null 2>&1 && ports="$ports $port"
+                else
+                    nc -z -w 1 "$candidate" "$port" >/dev/null 2>&1 && ports="$ports $port"
+                fi
+            done
+            echo "$candidate  open ports:${ports:- none} (candidate only)"
+        else
+            echo "$candidate  responding host (nc unavailable; ports unchecked)"
+        fi
+    done
     return 0
 }
 
-install_nmap() {
-    if [ -x /usr/bin/nmap ]; then
-        log "nmap present, using host discovery"
-        return 0
-    fi
-    if command -v apt-get >/dev/null 2>&1; then
-        log "installing nmap"
-        if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nmap >/dev/null 2>&1; then
-            log "nmap installed"
-            return 0
-        fi
-    fi
-    log "nmap unavailable, falling back to per-address probes"
+[ "$(id -u)" -eq 0 ] || die "the sweep must run as root"
+command -v flock >/dev/null 2>&1 || die "flock is unavailable"
+exec 9>/run/lock/wiz-keepalive.lock || exit 1
+
+flock -n -E 75 9
+lock_rc=$?
+[ "$lock_rc" -ne 75 ] || exit 0
+[ "$lock_rc" -eq 0 ] || die "cannot acquire the sweep lock"
+cidr=$(detect_cidr) || die "cannot detect an IPv4 subnet (/16 through /32)"
+if command -v nmap >/dev/null 2>&1; then
+    nmap -sn -n -T4 --max-retries 1 --host-timeout 5s "$cidr" >/dev/null
+    exit $?
+fi
+ping_hosts "$cidr" sweep || die "ping sweep failed"
+SWEEP
+    } | atomic_write "$WRAPPER" 755
 }
 
-# remove whichever scheduler is not being installed, so a unit never ends up
-# with both a cron entry and a systemd timer running the sweep.
 remove_timer() {
-    [ "$(id -u)" = 0 ] || return 0
-    systemctl disable --now wiz-keepalive.timer >/dev/null 2>&1
-    rm -f "$UNITFILE" "$TIMERFILE"
-    systemctl daemon-reload >/dev/null 2>&1
+    if [ -f "$UNITFILE" ] || [ -f "$TIMERFILE" ]; then
+        if using_systemd; then
+            systemctl disable --now wiz-keepalive.timer || return 1
+        fi
+        rm -f "$UNITFILE" "$TIMERFILE" || return 1
+        if using_systemd; then systemctl daemon-reload || return 1; fi
+    fi
+    return 0
 }
 
-remove_cron() {
-    rm -f "$CRONFILE"
+cron_running() {
+    if using_systemd; then systemctl is-active --quiet cron
+    elif command -v service >/dev/null 2>&1; then service cron status >/dev/null 2>&1
+    else return 1
+    fi
 }
 
 install_cron() {
-    minutes=$(stagger_minutes)
-    printf '%s\n' "$minutes * * * * root $WRAPPER" > "$CRONFILE" || return 1
-    chmod 644 "$CRONFILE" || return 1
-    # Only touch the cron service if it is not already running. Starting or
-    # enabling a unit needs root; without it the desktop asks for a
-    # polkit password, which is not something an installer should hit.
-    if command -v systemctl >/dev/null 2>&1; then
-        if [ "$(id -u)" != 0 ]; then
-            return 0
-        fi
-        if systemctl is-active --quiet cron 2>/dev/null; then
-            return 0
-        fi
-        systemctl enable cron >/dev/null 2>&1 || true
-        systemctl start cron >/dev/null 2>&1 || log "warning: could not start cron, check 'systemctl status cron'"
+    if using_systemd; then
+        systemctl is-enabled --quiet cron || systemctl enable cron || return 1
+        cron_running || systemctl start cron || return 1
+    else
+        cron_running || service cron start || return 1
     fi
-    return 0
+    cron_running || return 1
+    minutes=$(stagger_minutes) || return 1
+    atomic_write "$CRONFILE" 644 <<EOF
+$minutes * * * * root $WRAPPER
+EOF
 }
 
 install_timer() {
-    [ "$(id -u)" = 0 ] || return 1
-    cat > "$UNITFILE" <<EOF || return 1
+    atomic_write "$UNITFILE" 644 <<EOF || return 1
 [Unit]
-Description=WiZ keepalive sweep
-
+Description=WiZ trial network sweep
 [Service]
 Type=oneshot
 ExecStart=$WRAPPER
 EOF
-    cat > "$TIMERFILE" <<EOF || return 1
+    atomic_write "$TIMERFILE" 644 <<EOF || return 1
 [Unit]
-Description=Run WiZ keepalive sweep every $INTERVAL minutes
-
+Description=WiZ trial sweep every ten minutes
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=${INTERVAL}min
-AccuracySec=30s
-
+OnUnitActiveSec=10min
+RandomizedDelaySec=30s
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl daemon-reload >/dev/null 2>&1 || return 1
-    systemctl enable --now wiz-keepalive.timer >/dev/null 2>&1 || return 1
-    return 0
+    systemctl daemon-reload && systemctl enable --now wiz-keepalive.timer &&
+        systemctl is-active --quiet wiz-keepalive.timer
 }
 
 case "$1" in
     install)
         require_root install
-        cidr=$(detect_cidr) || die "could not detect a network interface"
-        log "subnet $cidr"
-        install_nmap
-        write_wrapper || die "could not write $WRAPPER"
-        remove_timer
-        remove_cron
-        if [ -x /usr/sbin/cron ] || [ -x /usr/bin/crontab ]; then
-            install_cron || die "could not install the cron entry"
-            log "installed: sweep every $INTERVAL minutes via cron"
-        elif command -v systemctl >/dev/null 2>&1; then
-            install_timer || die "could not install the systemd timer"
-            log "installed: sweep every $INTERVAL minutes via systemd timer"
-        else
-            die "no cron or systemd available to schedule the job"
+        cidr=$(detect_cidr) || die "cannot detect an IPv4 subnet (/16 through /32)"
+        log "subnet $cidr (check this is the fixture LAN)"
+        command -v flock >/dev/null 2>&1 || die "flock is required (util-linux)"
+        if ! command -v nmap >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+                log "trying to install nmap"
+                DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=0 -o Acquire::http::Timeout=10 -o Acquire::https::Timeout=10 -o DPkg::Lock::Timeout=10 install -y -qq nmap || log "nmap installation failed; checking ping fallback"
+            fi
+            command -v nmap >/dev/null 2>&1 || command -v ping >/dev/null 2>&1 || die "nmap and ping are both unavailable"
         fi
-        log "run 'sh $0 status' to check"
+        write_wrapper || die "cannot write $WRAPPER"
+        if command -v cron >/dev/null 2>&1 || command -v crontab >/dev/null 2>&1; then
+            install_cron || die "cron installation/startup failed; no successful installation"
+            remove_timer || die "cannot remove the previous timer"
+            log "installed: every ten minutes via cron"
+        elif using_systemd; then
+            install_timer || die "timer installation/startup failed"
+            rm -f "$CRONFILE" || die "cannot remove the previous cron entry"
+            log "installed: approximately every ten minutes via systemd"
+        else
+            die "cron or a running systemd is required"
+        fi
         ;;
     remove)
         require_root remove
-        remove_timer
-        remove_cron
-        rm -f "$WRAPPER"
-        log "removed"
+        remove_timer || die "cannot stop/remove the timer"
+        rm -f "$CRONFILE" "$WRAPPER" || die "cannot remove installed files"
+        log "removed (an already running sweep may finish)"
         ;;
     status)
-        if [ -f "$CRONFILE" ]; then
-            log "scheduler: cron"
-            cat "$CRONFILE"
+        healthy=0
+        if [ -f "$CRONFILE" ] && [ -f "$TIMERFILE" ]; then
+            log "error: both schedulers are configured"; healthy=1
+        elif [ -f "$CRONFILE" ]; then
+            log "scheduler: cron"; cat "$CRONFILE"
+            cron_running || { log "cron is not running"; healthy=1; }
         elif [ -f "$TIMERFILE" ]; then
             log "scheduler: systemd timer"
-            systemctl list-timers wiz-keepalive.timer --no-pager 2>/dev/null | head -3
+            if using_systemd; then
+                systemctl is-active --quiet wiz-keepalive.timer || { log "timer is not running"; healthy=1; }
+            else healthy=1
+            fi
         else
-            log "scheduler: none, not installed"
+            log "not installed"; healthy=1
         fi
-        if [ -x "$WRAPPER" ]; then
-            log "sweep script: present"
-        else
-            log "sweep script: MISSING"
+        [ -x "$WRAPPER" ] || { log "sweep script is missing"; healthy=1; }
+        cidr=$(detect_cidr) || { cidr=unknown; healthy=1; }
+        log "subnet $cidr"
+        if command -v nmap >/dev/null 2>&1; then log "method: nmap"
+        elif command -v ping >/dev/null 2>&1; then log "method: ping"
+        else log "no scan tool available"; healthy=1
         fi
-        cidr=$(detect_cidr) || true
-        log "subnet ${cidr:-unknown}"
-        if [ -x /usr/bin/nmap ]; then log "method: nmap"; else log "method: per-address probes"; fi
+        exit "$healthy"
         ;;
     run)
-        cidr=$(detect_cidr) || die "could not detect a network interface"
-        log "sweeping $cidr"
-        if [ ! -f "$WRAPPER" ]; then
-            [ "$(id -u)" = 0 ] || die "sweep script is missing, install it first with: sudo sh $0 install"
-            write_wrapper || die "could not write $WRAPPER"
-        fi
-        sh "$WRAPPER"
-        rc=$?
-        if [ $rc -ne 0 ]; then
-            die "sweep failed (exit $rc)"
-        fi
-        log "done"
+        require_root run
+        [ -x "$WRAPPER" ] || die "install the sweep first"
+        "$WRAPPER" || die "sweep failed"
         ;;
-    discover)
-        cidr=$(detect_cidr) || die "could not detect a network interface"
-        log "scanning $cidr for hosts that look like a hub"
-        tmp=$(mktemp) || die "could not create a temp file"
-        if [ -x /usr/bin/nmap ]; then
-            nmap -sn -n -T4 --host-timeout 5s "$cidr" 2>/dev/null | awk '/Nmap scan report/{print $NF}' > "$tmp"
-        else
-            ip=${cidr%/*}; base=${ip%.*}
-            for i in $(seq 1 254); do
-                ping -c 1 -W 1 "$base.$i" >/dev/null 2>&1 && echo "$base.$i"
-            done > "$tmp"
-        fi
-        while read -r h; do
-            [ -n "$h" ] || continue
-            if command -v nc >/dev/null 2>&1; then
-                found=""
-                for p in 22 80 443; do
-                    nc -z -w 1 "$h" "$p" >/dev/null 2>&1 && found="$found $p"
-                done
-                if [ -n "$found" ]; then
-                    echo "  $h  candidate (ports open:$found)"
-                else
-                    echo "  $h  no ssh or web ports open"
-                fi
-            else
-                echo "  $h  (nc not available, cannot check ports)"
-            fi
-        done < "$tmp"
-        rm -f "$tmp"
-        ;;
-    *)
-        echo "usage: sudo sh $0 install|remove|status|run|discover"
-        exit 1
-        ;;
+    discover) discover; exit $? ;;
+    *) die "usage: sudo sh $0 install|remove|status|run; sh $0 discover" ;;
 esac

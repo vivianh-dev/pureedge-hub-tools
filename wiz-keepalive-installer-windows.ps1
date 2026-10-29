@@ -1,139 +1,143 @@
-# wiz-keepalive-installer-windows.ps1
-#
-# Installs the WiZ keepalive sweep onto a Raspberry Pi hub, from Windows.
-#
-# One-liner (no file needed):
-#   iwr -useb https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive-installer-windows.ps1 | iex
-#
-# With hub addresses given:
-#   .\wiz-keepalive-installer-windows.ps1 install 192.168.1.50 192.168.1.51
-#   .\wiz-keepalive-installer-windows.ps1 remove 192.168.1.50
-#   .\wiz-keepalive-installer-windows.ps1 status 192.168.1.50
-#   .\wiz-keepalive-installer-windows.ps1 discover
-#
-# With no arguments it asks what to do and which hubs to use.
-#
-# Requires the Windows OpenSSH client (ssh and scp). On Windows 10 version
-# 1803 and later it is an optional feature that may need installing.
-# You will be asked for the hub password, once per hub (factory default on
-# these units: pi / DALInew).
-
+# Run on Windows PowerShell 5.1 or PowerShell 7 with Windows OpenSSH.
+# .\wiz-keepalive-installer-windows.ps1 install 192.168.1.50
 param(
-    [Parameter(Position = 0)]
-    [string]$Mode = "",
-    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
-    [string[]]$Hub,
-    [string]$PayloadUrl = "https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive.sh"
+    [Parameter(Position = 0)] [string]$Mode = '',
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)] [string[]]$Hub,
+    [string]$PayloadUrl = 'https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive.sh',
+    [string]$PayloadPath = ''
 )
 
-# discover lists hosts on this machine's subnet that look like a hub, so
-# nobody has to know the hub address in advance. These are candidates, not a
-# confirmed identification.
-function Find-Hubs {
-    $cidr = $null
+$ErrorActionPreference = 'Stop'
+
+function Get-CidrRange {
+    param([string]$Address, [int]$PrefixLength)
+    if ($PrefixLength -lt 16 -or $PrefixLength -gt 32) {
+        throw 'Supported IPv4 prefixes are /16 through /32; larger scans are refused.'
+    }
+    if ($Address -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw 'Invalid IPv4 address.' }
+    [uint64]$number = 0
+    foreach ($octet in $Address.Split('.')) {
+        if ([int]$octet -gt 255) { throw 'Invalid IPv4 address.' }
+        $number = $number * 256 + [uint64]$octet
+    }
+    [uint64]$size = [math]::Pow(2, 32 - $PrefixLength)
+    [uint64]$network = [math]::Floor($number / $size) * $size
+    [uint64]$first = $network
+    [uint64]$last = $network + $size - 1
+    if ($size -gt 2) { $first++; $last-- }
+    [pscustomobject]@{ Network = $network; Prefix = $PrefixLength; First = $first; Last = $last }
+}
+
+function ConvertTo-IPv4 {
+    param([uint64]$Number)
+    '{0}.{1}.{2}.{3}' -f (($Number -shr 24) -band 255), (($Number -shr 16) -band 255), (($Number -shr 8) -band 255), ($Number -band 255)
+}
+
+function Get-RespondingHosts {
+    param($Range)
+    # Sixteen asynchronous probes at a time. Never truncate a prefix to /24.
+    $batch = @()
     try {
-        $route = Get-NetRoute -DestinationPrefix 0.0.0.0/0 -ErrorAction Stop |
-            Sort-Object RouteMetric | Select-Object -First 1
-        $ip = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
-            Where-Object { $_.PrefixLength -ge 16 -and $_.PrefixLength -le 28 } | Select-Object -First 1
-        if ($ip) { $cidr = $ip.IPAddress + "/" + $ip.PrefixLength }
-    } catch { }
-    if (-not $cidr) {
-        Write-Output "could not determine this machine's network"
-        return
-    }
-    Write-Output "scanning $cidr for hosts that look like a hub"
-    $base = ($cidr -split '/')[0] -replace '\.\d+$', ''
-    $ping = New-Object System.Net.NetworkInformation.Ping
-    $replies = @()
-    foreach ($i in 1..254) {
-        $target = "$base.$i"
-        try {
-            $r = $ping.Send($target, 300)
-            if ($r.Status -eq "Success") { $replies += $r.Address.ToString() }
-        } catch { }
-    }
-    $ping.Dispose()
-    foreach ($h in $replies) {
-        $found = @()
-        foreach ($p in 22, 80, 443) {
-            $t = New-Object System.Net.Sockets.TcpClient
-            try {
-                $iar = $t.BeginConnect($h, $p, $null, $null)
-                if ($iar.AsyncWaitHandle.WaitOne(500, $false)) {
-                    $t.EndConnect($iar)
-                    if ($t.Connected) { $found += $p }
+        for ([uint64]$number = $Range.First; $number -le $Range.Last; $number++) {
+            $target = ConvertTo-IPv4 $number
+            $client = New-Object System.Net.NetworkInformation.Ping
+            try { $task = $client.SendPingAsync($target, 1000) }
+            catch { $client.Dispose(); throw }
+            $batch += [pscustomobject]@{ Client = $client; Task = $task }
+            if ($batch.Count -eq 16 -or $number -eq $Range.Last) {
+                foreach ($probe in $batch) {
+                    $reply = $probe.Task.GetAwaiter().GetResult()
+                    if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                        $reply.Address.ToString()
+                    }
                 }
-            } catch { } finally { $t.Close() }
+                foreach ($probe in $batch) { $probe.Client.Dispose() }
+                $batch = @()
+            }
         }
-        if ($found.Count -gt 0) {
-            Write-Output "  $h  candidate (ports open: $($found -join ' '))"
-        } else {
-            Write-Output "  $h  no ssh or web ports open"
-        }
+    } finally {
+        foreach ($probe in $batch) { $probe.Client.Dispose() }
     }
 }
 
-if ($Mode -eq "discover") {
-    Find-Hubs
-    exit 0
+function Find-Hubs {
+    $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+        Sort-Object RouteMetric | Select-Object -First 1
+    if (-not $route) { throw 'No IPv4 default route found.' }
+    $address = Get-NetIPAddress -InterfaceIndex $route.InterfaceIndex -AddressFamily IPv4 -ErrorAction Stop |
+        Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1
+    if (-not $address) { throw 'No usable IPv4 address found.' }
+    $range = Get-CidrRange $address.IPAddress $address.PrefixLength
+    Write-Host ('Scanning {0}/{1} for candidate hubs' -f (ConvertTo-IPv4 $range.Network), $range.Prefix)
+    foreach ($candidate in @(Get-RespondingHosts $range)) {
+        $ports = @()
+        foreach ($port in 22, 80, 443) {
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+                $pending = $client.BeginConnect($candidate, $port, $null, $null)
+                if ($pending.AsyncWaitHandle.WaitOne(500, $false)) {
+                    $client.EndConnect($pending)
+                    if ($client.Connected) { $ports += $port }
+                }
+            } catch { } finally { $client.Close() }
+        }
+        Write-Output "$candidate  open ports: $($ports -join ' ') (candidate only)"
+    }
 }
-
-if (-not $Mode) {
-    $Mode = Read-Host "install, remove, status or discover? (install)"
-    if (-not $Mode) { $Mode = "install" }
-}
-
-if ($Mode -notin @("install", "remove", "status", "run")) {
-    Write-Output "unknown action: $Mode"
-    exit 1
-}
-
-if (-not $Hub -or $Hub.Count -eq 0) {
-    $answer = Read-Host "hub IP address(es), space separated"
-    $Hub = $answer -split '\s+' | Where-Object { $_ }
-}
-
-if (-not $Hub -or $Hub.Count -eq 0) {
-    Write-Output "no hub address given"
-    exit 1
-}
-
-$ProgressPreference = "SilentlyContinue"
-$temp = Join-Path $env:TEMP "wiz-keepalive.sh"
 
 try {
-    Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -Uri $PayloadUrl -OutFile $temp
+    if (-not $Mode) {
+        $Mode = Read-Host 'install, remove, status, run or discover? (install)'
+        if (-not $Mode) { $Mode = 'install' }
+    }
+    $Mode = $Mode.ToLowerInvariant()
+    if ($Mode -notin @('install', 'remove', 'status', 'run', 'discover')) { throw "Unknown action: $Mode" }
+    if ($Mode -eq 'discover') { Find-Hubs; exit 0 }
+
+    if (-not $Hub -or $Hub.Count -eq 0) {
+        $Hub = (Read-Host 'hub IPv4 address(es) or hostnames, space separated') -split '\s+' | Where-Object { $_ }
+    }
+    if (-not $Hub -or $Hub.Count -eq 0) { throw 'No hub address given.' }
+    foreach ($target in $Hub) {
+        if ($target -notmatch '^[a-zA-Z0-9_][a-zA-Z0-9._-]*$') { throw "Invalid IPv4 address or hostname: $target" }
+    }
+    Get-Command ssh.exe -ErrorAction Stop | Out-Null
+    Get-Command scp.exe -ErrorAction Stop | Out-Null
+
+    $downloaded = $null
+    try {
+        if ($PayloadPath) {
+            $payload = (Resolve-Path -LiteralPath $PayloadPath -ErrorAction Stop).Path
+        } else {
+            $downloaded = [System.IO.Path]::GetTempFileName()
+            $payload = $downloaded
+            Invoke-WebRequest -UseBasicParsing -ErrorAction Stop -TimeoutSec 60 -Uri $PayloadUrl -OutFile $payload
+        }
+        if ((Get-Item -LiteralPath $payload).Length -eq 0) { throw 'Payload is empty.' }
+        $failed = $false
+        foreach ($target in $Hub) {
+            # scp preserves bytes; unique remote paths avoid install collisions.
+            $remoteFile = '/tmp/wiz-keepalive-' + [guid]::NewGuid().ToString('N') + '.sh'
+            Write-Host "${target}: $Mode"
+            & scp.exe -q -o ConnectTimeout=10 $payload "pi@${target}:$remoteFile"
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "${target}: copy failed"
+                $failed = $true
+                continue
+            }
+            $remote = 'chmod 600 {0} && sudo -n sh {0} {1}; rc=$?; if [ "$rc" -eq 0 ]; then rm -f {0}; else printf "Retry on the hub: sudo sh {0} {1}\n" >&2; fi; exit "$rc"' -f $remoteFile, $Mode
+            & ssh.exe -o ConnectTimeout=10 "pi@$target" $remote
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "${target}: failed (check the error above)"
+                $failed = $true
+            } else { Write-Host "${target}: succeeded" }
+        }
+    } finally {
+        if ($downloaded) { Remove-Item -LiteralPath $downloaded -Force -ErrorAction SilentlyContinue }
+    }
+    if ($failed) { exit 1 }
+    exit 0
 } catch {
-    Write-Output "could not download $PayloadUrl : $($_.Exception.Message)"
+    Write-Error -ErrorAction Continue $_
     exit 1
 }
-
-$failed = $false
-foreach ($h in $Hub) {
-    Write-Output "== $h =="
-    # Capture the remote exit status before the cleanup runs, so a failed
-    # install is not reported as a success.
-    # sudo -n so the hub either has passwordless sudo for pi or fails
-    # immediately, instead of hanging on a prompt nobody can see.
-    # scp copies the file byte for byte. Piping it through PowerShell would
-    # rewrite the line endings to CRLF and break the script on the hub.
-    & scp.exe -q $temp "pi@${h}:/tmp/wiz-keepalive.sh"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Output "== $h failed to copy"
-        $failed = $true
-        continue
-    }
-    & ssh.exe "pi@$h" "sudo -n sh /tmp/wiz-keepalive.sh $Mode; rc=`$?; rm -f /tmp/wiz-keepalive.sh; exit `$rc"
-    if ($LASTEXITCODE -eq 0) {
-        Write-Output "== $h ok"
-    } else {
-        Write-Output "== $h failed (check password and that the hub is reachable)"
-        Write-Output "   if the hub wants a sudo password, log in with ssh pi@$h and run: sudo sh /tmp/wiz-keepalive.sh $Mode"
-        $failed = $true
-    }
-}
-
-Remove-Item $temp -Force -ErrorAction SilentlyContinue
-if ($failed) { exit 1 }
-exit 0

@@ -1,104 +1,113 @@
 # pureedge-hub-tools
 
-Tooling for ATX LED / PureEdge hubs, including the DMX-to-WiZ converters.
+A trial network sweep for ATX LED / PureEdge Raspberry Pi hubs. It schedules
+local host discovery approximately every ten minutes. It does not send
+lighting commands or change fixture configuration.
 
-## WiZ keepalive sweep
+This is an **unproven workaround**, not an established fix for UWGB. Wi-Fi
+association, hub discovery and successful lighting commands are separate
+checks. The firmware inspected already attempts WiZ discovery about every
+five minutes and can skip commands to fixtures it considers missing.
 
-Keeps Wi-Fi lighting clients visible to the network by sweeping the local
-subnet on a fixed interval. The idea is that a fixture that stops talking
-gets aged out by the access point and drops off the controller, and a
-periodic sweep keeps it answering.
+## Install from a laptop
 
-This is a trial, not a proven fix. It increases how often the network sees
-the fixtures. It cannot repair a fixture that has failed to associate, RF or
-capacity problems, client isolation, or a hub whose lighting application has
-stopped. Note that the hub already talks to its fixtures every five minutes
-on its own, so the sweep may turn out to be redundant; the point of trying
-it is to see whether it changes anything.
+The laptop must reach the hub on SSH. The hub uses account `pi` and must
+allow passwordless sudo for unattended installation. Linux/macOS need `sh`,
+`curl` and OpenSSH; Windows needs PowerShell 5.1 or later and Windows
+OpenSSH (`ssh.exe` and `scp.exe`). Use the actual hub address below.
 
-Generic: works on any Raspberry Pi / Debian-family Linux, any subnet, wired or
-wireless. Nothing is hardcoded to a site.
-
-### One-line install
-
-Linux or macOS, from the machine that can reach the hub:
+Download and inspect the installer before running it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive-installer-linux.sh | sh -s -- install 192.168.1.50
+curl -fsSL https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive-installer-linux.sh -o wiz-keepalive-installer-linux.sh
+less wiz-keepalive-installer-linux.sh
+sh wiz-keepalive-installer-linux.sh install 192.168.1.50
 ```
 
-macOS uses the same command with `wiz-keepalive-installer-macos.command` in
-place of `wiz-keepalive-installer-linux.sh`.
-
-Windows, PowerShell:
+The Linux and macOS scripts both detect the laptop's platform. The macOS
+filename `wiz-keepalive-installer-macos.command` remains available too.
+Windows:
 
 ```powershell
-iwr -useb https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive-installer-windows.ps1 | iex
+Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wiz-keepalive-installer-windows.ps1 -OutFile wiz-keepalive-installer-windows.ps1
+Get-Content .\wiz-keepalive-installer-windows.ps1
+.\wiz-keepalive-installer-windows.ps1 install 192.168.1.50
 ```
 
-With no arguments the Windows installer asks what to do and which hubs to
-use. The Linux and macOS installers take the hub addresses as arguments, or
-ask for them if none are given.
+Actions are `install`, `status`, `run`, `remove` and `discover`. With no
+arguments, the installers prompt for an action and addresses. Multiple
+addresses can follow an action. `discover` scans the laptop's own subnet
+and lists candidates; an open web/SSH port does not identify an ATX hub.
 
-### Running on the hub directly
+The Unix installers use one SSH connection per hub. Windows uses separate
+copy and execution connections and may ask for the password twice. Failed
+remote executions retain a uniquely named payload and print a retry command.
+Successful executions remove that temporary payload.
+
+Payloads are downloaded explicitly; a nearby `wiz-keepalive.sh` is never
+selected automatically. For an offline laptop, explicitly select a saved,
+reviewed payload:
 
 ```sh
-sudo sh wiz-keepalive.sh install     # set it up
-sudo sh wiz-keepalive.sh status       # check it
-sudo sh wiz-keepalive.sh run          # one sweep now
-sudo sh wiz-keepalive.sh remove       # undo
+WIZ_KEEPALIVE_PAYLOAD=/path/to/wiz-keepalive.sh sh wiz-keepalive-installer-linux.sh install 192.168.1.50
 ```
 
-### Files
+```powershell
+.\wiz-keepalive-installer-windows.ps1 install 192.168.1.50 -PayloadPath .\wiz-keepalive.sh
+```
 
-| File | Runs on | Does |
-|---|---|---|
-| `wiz-keepalive.sh` | the Pi | The actual installer. Sets up the scheduled job on the hub. |
-| `wiz-keepalive-installer-linux.sh` | Linux laptop | Fetches the installer and pushes it to the hub over SSH. |
-| `wiz-keepalive-installer-macos.command` | Mac | Same. |
-| `wiz-keepalive-installer-windows.ps1` | Windows | Same. |
+## On the Pi
 
-The pushers need `ssh`, and `scp` on Windows. macOS has both built in; on
-Linux, install `openssh-client`. The hub password is asked for once per hub
-on Linux and macOS, twice on Windows (once to copy the file, once to run it).
-The factory default on these units is `pi` / `DALInew`.
+```sh
+sudo sh wiz-keepalive.sh install
+sudo sh wiz-keepalive.sh status
+sudo sh wiz-keepalive.sh run
+sudo sh wiz-keepalive.sh remove
+```
 
-The install step runs as root on the hub. It uses `sudo -n`, so a hub whose
-`pi` account has passwordless sudo completes unattended, and a hub that
-wants a password fails immediately with a message instead of hanging on a
-prompt. The same is true of the systemd timer path: it is only ever touched
-as root, so it never raises an authentication prompt.
+The script detects the IPv4 subnet on the default-route interface, falling
+back to another configured interface if no default route exists. Check the
+printed subnet is the fixture LAN, especially on a Pi with several interfaces
+or a VPN. An explicit interface is saved into the installed sweep:
 
-### What it does on the hub
+```sh
+sudo env WIZ_KEEPALIVE_INTERFACE=wlan0 sh wiz-keepalive.sh install
+```
 
-- Detects the subnet from the interface that carries the default route, so
-  it works on any network without configuration.
-- Writes `/usr/local/bin/wiz-keepalive-sweep`, which runs `nmap -sn` (host
-  discovery over ARP) against that subnet. If nmap is not installed it falls
-  back to a broadcast ping. It installs nmap from apt when it can and works
-  offline otherwise.
-- Schedules it every 10 minutes. The minute offsets are derived from the
-  unit's machine-id, so hubs on one site do not all sweep at the same
-  moment. Uses cron where cron is present, otherwise a systemd timer, and
-  never leaves both installed at once.
-- The sweep itself is local and sends nothing off the network. Installing
-  may contact the package repository if nmap is not already on the hub, and
-  the scheduler will of course write its own service logs.
+Supported prefixes are `/16` through `/32`. Wider networks fail explicitly;
+they are not silently reduced to a `/24`. The fallback handles subnet
+boundaries, including `/31` and `/32`. It runs at most sixteen one-second
+ping probes concurrently. A `/16` fallback can take over an hour; use nmap
+for large networks. A lock skips overlapping sweeps.
 
-### Notes
+Installation attempts to install nmap with apt when it is absent; this may
+contact package repositories. If unavailable, the script requires ping.
+The Pi also needs `ip`, `awk`, `flock` (util-linux), and cron or a running
+systemd. No lighting application or OS image is replaced.
 
-- The sweep is a diagnostic-grade workaround for client sleep and AP aging
-  behavior, not a replacement for fixing AP settings. If the access point has
-  a client idle timeout, tuning that is the real fix.
-- It does not change the hub's lighting behavior, only how often the network
-  sees the fixtures.
-- The sweep runs as root, from cron or from the systemd timer. Run as root,
-  nmap uses ARP for host discovery; unprivileged it falls back to TCP
-  connect probes, which is slower and will not find hosts that block those
-  ports.
-- `curl -fsSL` is deliberate: `-f` stops a 404 page being piped into `sh`,
-  `-s` hides the progress meter, `-S` still shows errors, `-L` follows
-  redirects.
+Cron runs six times per hour, ten minutes apart, with a machine-id-derived
+offset; offsets can collide between hubs. The systemd fallback runs about
+every ten minutes with a small randomized delay. The installer verifies the
+scheduler starts and removes the alternate scheduler only after success.
+It touches systemd timer cleanup only when its timer/service files exist.
+
+`status` returns nonzero for a missing/inactive scheduler, missing sweep,
+invalid subnet or missing scan tool. A successful scan means the scan tool
+completed, not that every fixture answered or that lighting control works.
+Removal unschedules future sweeps; an already running sweep may finish.
+
+## Verification
+
+```sh
+python3 -m unittest discover -s tests -v
+pwsh -NoProfile -File tests/test_windows.ps1
+```
+
+Tests isolate package/service commands, SSH and host discovery. They cover
+subnet boundaries, scheduler failures, payload selection, remote failure
+recovery, and PowerShell discovery dispatch. Real ATX hardware and native
+Windows/macOS network integration still need a site test on one hub before
+rollout. A supplied hub-image update remains ATX's responsibility.
 
 ## License
 
