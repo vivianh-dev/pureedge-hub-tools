@@ -145,6 +145,9 @@ class Scripts(unittest.TestCase):
 
     def test_interface_override_survives_install(self):
         self.assert_ok(self.run_shell(self.hub, ['install'], {'WIZ_KEEPALIVE_INTERFACE': 'wlan0'}))
+        status = self.run_shell(self.hub, ['status'])
+        self.assert_ok(status)
+        self.assertIn('subnet 10.2.3.0/24', status.stdout)
         self.assert_ok(subprocess.run(['sh', str(self.root/'sweep')], env=self.env, text=True, capture_output=True))
         self.assertTrue(any('10.2.3.0/24' in line for line in self.lines()))
 

@@ -492,7 +492,11 @@ case "$1" in
             log "not installed"; healthy=1
         fi
         [ -x "$WRAPPER" ] || { log "sweep script is missing"; healthy=1; }
-        cidr=$(detect_cidr) || { cidr=unknown; healthy=1; }
+        saved_interface=""
+        if [ -f "$WRAPPER" ]; then
+            saved_interface=$(awk -F= '/^WIZ_KEEPALIVE_INTERFACE=/{print $2; exit}' "$WRAPPER")
+        fi
+        cidr=$(WIZ_KEEPALIVE_INTERFACE="$saved_interface" detect_cidr) || { cidr=unknown; healthy=1; }
         log "subnet $cidr"
         if command -v nmap >/dev/null 2>&1; then log "method: nmap"
         elif command -v ping >/dev/null 2>&1; then log "method: ping"
