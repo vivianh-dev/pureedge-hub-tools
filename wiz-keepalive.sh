@@ -107,6 +107,34 @@ install_nmap() {
     log "nmap unavailable, using broadcast ping instead"
 }
 
+# discover lists hosts on the local subnet that look like a hub, by checking
+# which ones answer on the ports the hub's web interface uses.
+discover() {
+    cidr=$(detect_cidr) || die "could not detect a network interface"
+    log "scanning $cidr"
+    if [ -x /usr/bin/nmap ]; then
+        nmap -sn -n -T4 --host-timeout 5s "$cidr" 2>/dev/null | awk '/Nmap scan report/{print $NF}' > /tmp/wiz-hosts.$$
+    else
+        base=$(echo "$cidr" | cut -d. -f1-3)
+        for i in $(seq 1 254); do
+            ping -c 1 -W 1 "$base.$i" >/dev/null 2>&1 && echo "$base.$i"
+        done > /tmp/wiz-hosts.$$
+    fi
+    log "hosts answering:"
+    while read -r h; do
+        [ -n "$h" ] || continue
+        if command -v nc >/dev/null 2>&1; then
+            for p in 80 443 5500; do
+                nc -z -w 1 "$h" "$p" >/dev/null 2>&1 && { echo "  $h  (hub, port $p)"; continue 2; }
+            done
+            echo "  $h  (no hub ports open)"
+        else
+            echo "  $h"
+        fi
+    done < /tmp/wiz-hosts.$$
+    rm -f /tmp/wiz-hosts.$$
+}
+
 case "$1" in
     install)
         [ "$(id -u)" = 0 ] || die "run as root or with sudo"
@@ -155,8 +183,11 @@ case "$1" in
         sh "$WRAPPER"
         log "done"
         ;;
+    discover)
+        discover
+        ;;
     *)
-        echo "usage: sudo sh $0 install|remove|status|run"
+        echo "usage: sudo sh $0 install|remove|status|run|discover"
         exit 1
         ;;
 esac

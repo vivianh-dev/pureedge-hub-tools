@@ -22,6 +22,35 @@ PAYLOAD_URL="https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/ma
 HERE=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
 PAYLOAD="$HERE/wiz-keepalive.sh"
 
+# discover lists hosts on this machine's subnet that answer on the ports the
+# hub web interface uses, so nobody has to know the hub address in advance.
+discover() {
+    if command -v nmap >/dev/null 2>&1; then
+        nmap -sn -n -T4 --host-timeout 5s "$(ip -4 route show | awk '$3 != "via" && $1 != "default" {print $1; exit}')" 2>/dev/null |
+            awk '/Nmap scan report/{print $NF}'
+    else
+        base=$(ip -4 addr show scope global | awk '/inet /{split($2,a,"."); print a[1]"."a[2]"."a[3]; exit}')
+        for i in $(seq 1 254); do
+            ping -c 1 -W 1 "$base.$i" >/dev/null 2>&1 && echo "$base.$i"
+        done
+    fi | while read -r h; do
+        [ -n "$h" ] || continue
+        if command -v nc >/dev/null 2>&1; then
+            for p in 80 443 5500; do
+                nc -z -w 1 "$h" "$p" >/dev/null 2>&1 && { echo "$h  (hub, port $p)"; continue 2; }
+            done
+            echo "$h  (no hub ports open)"
+        else
+            echo "$h"
+        fi
+    done
+}
+
+if [ "$MODE" = "discover" ]; then
+    discover
+    exit 0
+fi
+
 if [ ! -f "$PAYLOAD" ]; then
     PAYLOAD=$(mktemp)
     curl -fsSL "$PAYLOAD_URL" -o "$PAYLOAD" || { echo "could not download $PAYLOAD_URL"; exit 1; }
