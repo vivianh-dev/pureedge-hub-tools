@@ -71,12 +71,15 @@ candidate hosts, not confirmed hubs. A scan failure returns nonzero.
 ## WireGuard and SSH (separate from the trial sweep)
 
 For a **customer** with a pre-generated encrypted support bundle, use this
-command after replacing the hub IP and bundle filename. Send the bundle
+command after replacing the hub IP. Send the bundle
 password separately. Each bundle is for one Pi and expires 24 hours after
 creation. The customer needs no Neon account or laptop VPN.
 
+The current bundle below expires **2026-11-06 at 16:07:27 UTC**. After that,
+create a new bundle and replace its filename in the command.
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wireguard-customer-macos.command -o wireguard-customer-macos.command && sh wireguard-customer-macos.command install 192.168.1.50 https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/bundles/customer-support.age
+curl -fsSL https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/wireguard-customer-macos.command -o wireguard-customer-macos.command && sh wireguard-customer-macos.command install 192.168.1.50 https://raw.githubusercontent.com/vivianh-dev/pureedge-hub-tools/main/bundles/customer-support-20261105.age
 ```
 
 See [customer setup and expiry](README.md#customer-installation-temporary-wireguard-and-ssh-support).
